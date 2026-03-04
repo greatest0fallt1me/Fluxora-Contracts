@@ -90,6 +90,33 @@ pub struct Withdrawal {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct RateUpdated {
+    pub stream_id: u64,
+    pub old_rate_per_second: i128,
+    pub new_rate_per_second: i128,
+    /// Ledger timestamp when the rate update became effective.
+    pub effective_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamEndShortened {
+    pub stream_id: u64,
+    pub old_end_time: u64,
+    pub new_end_time: u64,
+    pub refund_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamEndExtended {
+    pub stream_id: u64,
+    pub old_end_time: u64,
+    pub new_end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Stream {
     pub stream_id: u64,
     pub sender: Address,
@@ -711,18 +738,8 @@ impl FluxoraStream {
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
         let unstreamed = stream.deposit_amount - accrued;
 
-        // REENTRANCY PROTECTION: state is updated and persisted before the token
-        // transfer executes. Soroban's execution model prevents true reentrancy,
-        // but we follow the checks-effects-interactions pattern as best practice.
-        // Assumption: the token contract does not reenter this contract.
-        stream.status = StreamStatus::Cancelled;
-        save_stream(&env, &stream);
-
-        // Transfer after state is saved
-        if unstreamed > 0 {
-            let token_client = token::Client::new(&env, &get_token(&env));
-            token_client.transfer(&env.current_contract_address(), &stream.sender, &unstreamed);
         // CEI: update state before external token transfer to reduce reentrancy risk.
+        // Assumption: the token contract does not reenter this contract.
         stream.status = StreamStatus::Cancelled;
         stream.cancelled_at = Some(env.ledger().timestamp());
         save_stream(&env, &stream);
@@ -811,13 +828,6 @@ impl FluxoraStream {
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
         let withdrawable = accrued - stream.withdrawn_amount;
 
-        // REENTRANCY PROTECTION: state is updated and persisted before the token
-        // transfer executes. Soroban's execution model prevents true reentrancy,
-        // but we follow the checks-effects-interactions pattern as best practice.
-        // Assumption: the token contract does not reenter this contract.
-        stream.withdrawn_amount += withdrawable;
-
-        if stream.withdrawn_amount >= stream.deposit_amount {
         // Handle zero withdrawable: return 0 without transfer or state change (idempotent).
         // This occurs before cliff or when all accrued funds have been withdrawn.
         // Frontends can safely call withdraw without checking balance first.
@@ -826,6 +836,7 @@ impl FluxoraStream {
         }
 
         // CEI: update state before external token transfer to reduce reentrancy risk.
+        // Assumption: the token contract does not reenter this contract.
         stream.withdrawn_amount += withdrawable;
         let completed_now = stream.withdrawn_amount == stream.deposit_amount;
         if completed_now {
@@ -833,17 +844,6 @@ impl FluxoraStream {
         }
         save_stream(&env, &stream);
 
-        // Transfer after state is saved
-        let token_client = token::Client::new(&env, &get_token(&env));
-        token_client.transfer(
-            &env.current_contract_address(),
-            &stream.recipient,
-            &withdrawable,
-        );
-
-        env.events()
-            .publish((symbol_short!("withdrew"), stream_id), withdrawable);
-        withdrawable
         push_token(&env, &stream.recipient, withdrawable);
 
         env.events().publish(
@@ -861,6 +861,7 @@ impl FluxoraStream {
                 StreamEvent::StreamCompleted(stream_id),
             );
         }
+
         Ok(withdrawable)
     }
 
@@ -1079,6 +1080,346 @@ impl FluxoraStream {
         read_stream_count(&env)
     }
 
+    /// Update the `rate_per_second` of an existing stream.
+    ///
+    /// This is a **forward-only** rate change that preserves all existing invariants:
+    ///
+    /// - The stream must be in `Active` or `Paused` state (not terminal).
+    /// - The caller must be the original stream sender.
+    /// - The new rate must be **strictly greater** than the current rate.
+    /// - The existing `deposit_amount` must still cover `new_rate × (end_time - start_time)`.
+    ///
+    /// Historical accrual is monotonic: at any given ledger time, the updated rate can
+    /// only increase (never decrease) the accrued amount relative to the previous rate.
+    /// This ensures the recipient's entitlement is never reduced by a rate update.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_rate_per_second`: New streaming rate in tokens per second (must be > current rate).
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    ///
+    /// # Events
+    /// - Emits a `rate_upd` event with a `RateUpdated` payload capturing old/new rate and effective time.
+    pub fn update_rate_per_second(
+        env: Env,
+        stream_id: u64,
+        new_rate_per_second: i128,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can update the rate.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only mutable (non-terminal) streams can be updated.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only update active or paused streams"
+        );
+
+        assert!(new_rate_per_second > 0, "new rate must be positive");
+
+        let old_rate = stream.rate_per_second;
+        // Forward-only semantics: disallow decreases.
+        assert!(
+            new_rate_per_second > old_rate,
+            "new rate must be greater than current rate"
+        );
+
+        // Validate that the existing deposit still covers the new total streamable amount.
+        let duration = (stream.end_time - stream.start_time) as i128;
+        let total_streamable = new_rate_per_second
+            .checked_mul(duration)
+            .expect("overflow calculating total streamable amount for new rate");
+        assert!(
+            stream.deposit_amount >= total_streamable,
+            "deposit_amount must cover total streamable amount for new rate"
+        );
+
+        stream.rate_per_second = new_rate_per_second;
+        save_stream(&env, &stream);
+
+        env.events().publish(
+            (symbol_short!("rate_upd"), stream_id),
+            RateUpdated {
+                stream_id,
+                old_rate_per_second: old_rate,
+                new_rate_per_second,
+                effective_time: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Shorten a stream's `end_time` and refund unstreamed tokens to the sender.
+    ///
+    /// This operation safely reduces the remaining duration of an **Active** or **Paused**
+    /// stream while:
+    ///
+    /// - Preserving all already-accrued entitlement for the recipient.
+    /// - Refunding only the portion of the deposit that can never accrue under the new end time.
+    /// - Maintaining the invariant `deposit_amount >= accrued(now)` at the moment of update.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_end_time`: New stream end timestamp (must be:
+    ///   - `> current_ledger_timestamp`
+    ///   - `> start_time`
+    ///   - `>= cliff_time`
+    ///   - `< current end_time`).
+    ///
+    /// # Behaviour
+    /// - Computes the new maximum streamable amount as
+    ///   `rate_per_second × (new_end_time - start_time)`.
+    /// - Sets `deposit_amount` to this new maximum streamable amount.
+    /// - Refunds `old_deposit - new_deposit` to the sender.
+    /// - Leaves accrued amount at the current ledger time unchanged.
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    ///
+    /// # Events
+    /// - Emits a `sched_shrt` event with a `StreamEndShortened` payload describing the change.
+    pub fn shorten_stream_end_time(
+        env: Env,
+        stream_id: u64,
+        new_end_time: u64,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can modify the schedule.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only non-terminal streams may be shortened.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only shorten active or paused streams"
+        );
+
+        let now = env.ledger().timestamp();
+
+        // New end time must be in the future relative to the current ledger timestamp.
+        assert!(
+            new_end_time >= now,
+            "new end_time must be >= current ledger timestamp"
+        );
+
+        // Must strictly shorten the schedule.
+        assert!(
+            new_end_time < stream.end_time,
+            "new end_time must be before existing end_time"
+        );
+
+        // Preserve basic schedule invariants.
+        assert!(
+            new_end_time > stream.start_time,
+            "new end_time must be after start_time"
+        );
+        assert!(
+            new_end_time >= stream.cliff_time,
+            "new end_time must be >= cliff_time"
+        );
+
+        // Compute new maximum streamable amount under the shortened schedule.
+        let new_duration = (new_end_time - stream.start_time) as i128;
+        let new_max_streamable = stream
+            .rate_per_second
+            .checked_mul(new_duration)
+            .expect("overflow calculating total streamable amount for shortened schedule");
+
+        // Deposit must still be sufficient to cover the shortened schedule (by construction
+        // this should hold given the original validation, but we keep an explicit assert).
+        assert!(
+            new_max_streamable <= stream.deposit_amount,
+            "shortened schedule must not increase total streamable amount"
+        );
+
+        let old_end_time = stream.end_time;
+        let old_deposit = stream.deposit_amount;
+        let refund_amount = old_deposit - new_max_streamable;
+
+        stream.end_time = new_end_time;
+        stream.deposit_amount = new_max_streamable;
+        save_stream(&env, &stream);
+
+        if refund_amount > 0 {
+            push_token(&env, &stream.sender, refund_amount);
+        }
+
+        env.events().publish(
+            (symbol_short!("end_shrt"), stream_id),
+            StreamEndShortened {
+                stream_id,
+                old_end_time,
+                new_end_time,
+                refund_amount,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Extend a stream's `end_time` without changing its deposit or rate.
+    ///
+    /// This operation lengthens the schedule of an **Active** or **Paused** stream while:
+    ///
+    /// - Keeping the rate and deposit fixed.
+    /// - Ensuring the existing `deposit_amount` still safely covers the extended duration.
+    /// - Preserving accrued amount at the current ledger time.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_end_time`: New stream end timestamp (must be:
+    ///   - `> current end_time`
+    ///   - `> start_time`
+    ///   - `>= cliff_time`
+    ///   - `>= current_ledger_timestamp`).
+    ///
+    /// # Behaviour
+    /// - Validates `deposit_amount >= rate_per_second × (new_end_time - start_time)`.
+    /// - Updates `end_time` in-place; all other fields remain unchanged.
+    /// - Accrual at the current ledger time is unchanged; future accrual continues linearly.
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    ///
+    /// # Events
+    /// - Emits an `end_ext` event with a `StreamEndExtended` payload describing the change.
+    pub fn extend_stream_end_time(
+        env: Env,
+        stream_id: u64,
+        new_end_time: u64,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can modify the schedule.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only non-terminal streams may be extended.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only extend active or paused streams"
+        );
+
+        let now = env.ledger().timestamp();
+
+        // Must move end_time forward in time.
+        assert!(
+            new_end_time > stream.end_time,
+            "new end_time must be after existing end_time"
+        );
+
+        // Keep basic schedule invariants intact.
+        assert!(
+            new_end_time > stream.start_time,
+            "new end_time must be after start_time"
+        );
+        assert!(
+            new_end_time >= stream.cliff_time,
+            "new end_time must be >= cliff_time"
+        );
+        assert!(
+            new_end_time >= now,
+            "new end_time must be >= current ledger timestamp"
+        );
+
+        // Ensure existing deposit still covers the extended schedule at the current rate.
+        let new_duration = (new_end_time - stream.start_time) as i128;
+        let new_total_streamable = stream
+            .rate_per_second
+            .checked_mul(new_duration)
+            .expect("overflow calculating total streamable amount for extended schedule");
+
+        assert!(
+            new_total_streamable <= stream.deposit_amount,
+            "deposit_amount must cover total streamable amount for extended schedule"
+        );
+
+        let old_end_time = stream.end_time;
+        stream.end_time = new_end_time;
+        save_stream(&env, &stream);
+
+        env.events().publish(
+            (symbol_short!("end_ext"), stream_id),
+            StreamEndExtended {
+                stream_id,
+                old_end_time,
+                new_end_time,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Decrease a stream's `deposit_amount` by refunding only non-accrued funds to the sender.
+    ///
+    /// This operation allows the sender to safely reclaim part of the remaining deposit while:
+    ///
+    /// - Preserving all already-accrued entitlement for the recipient.
+    /// - Maintaining the invariant `new_deposit >= accrued(now)` at the moment of update.
+    /// - Preserving `withdrawn_amount` and status.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_deposit_amount`: The new desired deposit (must be:
+    ///   - `> 0`
+    ///   - `<= current deposit_amount`
+    ///   - `>= accrued(now)`).
+    ///
+    /// # Behaviour
+    /// - Computes `accrued(now)` using the current schedule.
+    /// - Ensures `new_deposit_amount >= accrued(now)` so accrued funds cannot be revoked.
+    /// - Refunds `old_deposit - new_deposit_amount` to the sender.
+    /// - Updates `deposit_amount` in-place; all other fields remain unchanged.
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    pub fn decrease_stream_deposit(
+        env: Env,
+        stream_id: u64,
+        new_deposit_amount: i128,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can decrease the deposit.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only non-terminal streams may be modified.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only decrease deposit for active or paused streams"
+        );
+
+        assert!(new_deposit_amount > 0, "new deposit must be positive");
+        assert!(
+            new_deposit_amount <= stream.deposit_amount,
+            "new deposit must not exceed current deposit_amount"
+        );
+
+        // Compute total accrued at the current ledger time using the existing schedule.
+        let accrued_now = Self::calculate_accrued(env.clone(), stream_id)?;
+
+        // Do not allow decreasing below what has already accrued.
+        assert!(
+            new_deposit_amount >= accrued_now,
+            "new deposit must be >= currently accrued amount"
+        );
+
+        let old_deposit = stream.deposit_amount;
+        let refund_amount = old_deposit - new_deposit_amount;
+
+        stream.deposit_amount = new_deposit_amount;
+        save_stream(&env, &stream);
+
+        if refund_amount > 0 {
+            push_token(&env, &stream.sender, refund_amount);
+        }
+
+        Ok(())
+    }
+
     /// Return the contract version number.
     ///
     /// Reads the compile-time `CONTRACT_VERSION` constant — no storage access required.
@@ -1166,18 +1507,8 @@ impl FluxoraStream {
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
         let unstreamed = stream.deposit_amount - accrued;
 
-        // REENTRANCY PROTECTION: state is updated and persisted before the token
-        // transfer executes. Soroban's execution model prevents true reentrancy,
-        // but we follow the checks-effects-interactions pattern as best practice.
-        // Assumption: the token contract does not reenter this contract.
-        stream.status = StreamStatus::Cancelled;
-        save_stream(&env, &stream);
-
-        // Transfer after state is saved
-        if unstreamed > 0 {
-            let token_client = token::Client::new(&env, &get_token(&env));
-            token_client.transfer(&env.current_contract_address(), &stream.sender, &unstreamed);
         // CEI: update state before external token transfer to reduce reentrancy risk.
+        // Assumption: the token contract does not reenter this contract.
         stream.status = StreamStatus::Cancelled;
         stream.cancelled_at = Some(env.ledger().timestamp());
         save_stream(&env, &stream);
