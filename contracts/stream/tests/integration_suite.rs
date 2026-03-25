@@ -2108,7 +2108,6 @@ fn integration_batch_withdraw_completed_streams_yield_zero() {
         "completed id2 must yield 0"
     );
 
-
     // Balance conservation
     let total_after = ctx.token.balance(&ctx.sender)
         + ctx.token.balance(&ctx.recipient)
@@ -2189,7 +2188,8 @@ fn integration_double_init_does_not_affect_cancel_refund() {
 
     // Attempt re-init
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.client().init(&Address::generate(&ctx.env), &Address::generate(&ctx.env));
+        ctx.client()
+            .init(&Address::generate(&ctx.env), &Address::generate(&ctx.env));
     }));
 
     // Cancel at t=400 — should refund 600 to sender
@@ -2270,7 +2270,13 @@ fn integration_stream_counter_continuous_after_reinit() {
 
     ctx.env.ledger().set_timestamp(0);
     let id1 = ctx.client().create_stream(
-        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
     );
     assert_eq!(id1, 1, "second stream must get ID 1");
     assert_eq!(ctx.client().get_stream_count(), 2);
@@ -2301,7 +2307,9 @@ fn integration_uninitialised_create_stream_panics() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     env.ledger().set_timestamp(0);
-    client.create_stream(&sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64);
+    client.create_stream(
+        &sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
 }
 
 /// Uninitialised contract: admin operations must panic with missing config.
@@ -2395,4 +2403,3 @@ fn integration_init_unblocks_all_paths() {
     assert_eq!(stream_id, 0);
     assert_eq!(client.get_stream_count(), 1);
 }
-

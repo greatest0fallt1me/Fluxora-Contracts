@@ -10970,7 +10970,10 @@ fn regression_double_init_counter_continuity() {
     let id2 = client.create_stream(
         &sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
     );
-    assert_eq!(id2, 2, "stream ID must continue from 2 after failed re-init");
+    assert_eq!(
+        id2, 2,
+        "stream ID must continue from 2 after failed re-init"
+    );
     assert_eq!(client.get_stream_count(), 3);
 }
 
@@ -11046,7 +11049,9 @@ fn regression_missing_config_create_stream_panics() {
     let recipient = Address::generate(&env);
 
     env.ledger().set_timestamp(0);
-    client.create_stream(&sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64);
+    client.create_stream(
+        &sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
 }
 
 /// `create_streams()` (batch) on uninitialised contract must also fail.
@@ -11485,4 +11490,3 @@ fn regression_double_init_interleaved_with_lifecycle() {
     assert_eq!(stream_id2, 1);
     assert_eq!(client.get_stream_count(), 2);
 }
-
