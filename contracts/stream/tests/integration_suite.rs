@@ -1,6 +1,8 @@
 extern crate std;
 
-use fluxora_stream::{CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamStatus};
+use fluxora_stream::{
+    CreateStreamParams, DataKey, FluxoraStream, FluxoraStreamClient, StreamStatus,
+};
 use soroban_sdk::log;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -2116,4 +2118,253 @@ fn integration_batch_withdraw_completed_streams_yield_zero() {
 
     // Contract holds only the remaining 400 for id1
     assert_eq!(ctx.token.balance(&ctx.contract_id), 400);
+}
+
+// ===========================================================================
+// Integration: Persistent stream TTL extend-on-read/write (Issue #248)
+// ===========================================================================
+
+/// Full lifecycle integration: instance TTL and stream TTL are maintained
+/// through create → withdraw → pause → resume → complete.
+#[test]
+fn integration_ttl_full_lifecycle() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Helper: check stream and instance TTL
+    let check_ttl = |label: &str| {
+        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Stream(stream_id))
+        });
+        assert!(
+            stream_ttl >= 120_960,
+            "{label}: stream TTL must be >= 120_960, got {stream_ttl}"
+        );
+
+        let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Instance;
+            ctx.env.storage().instance().get_ttl()
+        });
+        assert!(
+            instance_ttl >= 120_960,
+            "{label}: instance TTL must be >= 120_960, got {instance_ttl}"
+        );
+    };
+
+    check_ttl("after create");
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id);
+    check_ttl("after withdraw");
+
+    ctx.client().pause_stream(&stream_id);
+    check_ttl("after pause");
+
+    ctx.client().resume_stream(&stream_id);
+    check_ttl("after resume");
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    check_ttl("after completion");
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+    check_ttl("after get_stream_state on completed");
+}
+
+/// Cancel flow: TTL maintained through cancel and post-cancel withdraw.
+#[test]
+fn integration_ttl_cancel_and_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after cancel must be >= 120_960, got {stream_ttl}"
+    );
+
+    // Withdraw accrued from cancelled stream
+    ctx.client().withdraw(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after post-cancel withdraw must be >= 120_960, got {stream_ttl}"
+    );
+}
+
+/// Batch create: all stream entries and recipient indexes get proper TTL.
+#[test]
+fn integration_ttl_batch_create() {
+    let ctx = TestContext::setup();
+    let recipient2 = Address::generate(&ctx.env);
+
+    let params = soroban_sdk::vec![
+        &ctx.env,
+        CreateStreamParams {
+            recipient: ctx.recipient.clone(),
+            deposit_amount: 500,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 500,
+        },
+        CreateStreamParams {
+            recipient: recipient2.clone(),
+            deposit_amount: 500,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 500,
+        },
+    ];
+
+    ctx.env.ledger().set_timestamp(0);
+    let ids = ctx.client().create_streams(&ctx.sender, &params);
+
+    for i in 0..ids.len() {
+        let sid = ids.get(i).unwrap();
+        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Stream(sid))
+        });
+        assert!(
+            stream_ttl >= 120_960,
+            "batch stream {sid} TTL must be >= 120_960, got {stream_ttl}"
+        );
+    }
+
+    for recip in [&ctx.recipient, &recipient2] {
+        let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::RecipientStreams(recip.clone()))
+        });
+        assert!(
+            idx_ttl >= 120_960,
+            "recipient index TTL must be >= 120_960, got {idx_ttl}"
+        );
+    }
+}
+
+/// Close completed stream removes persistent entry entirely.
+#[test]
+fn integration_ttl_close_removes_entry() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    ctx.client().close_completed_stream(&stream_id);
+
+    let exists = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .persistent()
+            .has(&DataKey::Stream(stream_id))
+    });
+    assert!(!exists, "stream entry must be removed after close");
+}
+
+/// Admin operations (pause/resume/cancel) maintain TTL.
+#[test]
+fn integration_ttl_admin_operations() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream_as_admin(&stream_id);
+    let ttl_after_pause = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Stream(stream_id))
+    });
+    assert!(ttl_after_pause >= 120_960);
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+    let ttl_after_resume = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Stream(stream_id))
+    });
+    assert!(ttl_after_resume >= 120_960);
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let ttl_after_cancel = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Stream(stream_id))
+    });
+    assert!(ttl_after_cancel >= 120_960);
+}
+
+/// Instance TTL is maintained across init, config reads, and admin writes.
+#[test]
+fn integration_ttl_instance_storage_across_operations() {
+    let ctx = TestContext::setup();
+
+    let check_instance_ttl = || {
+        ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Instance;
+            let ttl = ctx.env.storage().instance().get_ttl();
+            assert!(ttl >= 120_960, "instance TTL must be >= 120_960, got {ttl}");
+        });
+    };
+
+    // After init (via TestContext::setup)
+    check_instance_ttl();
+
+    // After get_config
+    ctx.client().get_config();
+    check_instance_ttl();
+
+    // After get_stream_count
+    ctx.client().get_stream_count();
+    check_instance_ttl();
+
+    // After create_stream (bumps NextStreamId)
+    ctx.create_default_stream();
+    check_instance_ttl();
+
+    // After set_contract_paused
+    ctx.client().set_contract_paused(&true);
+    check_instance_ttl();
+    ctx.client().set_contract_paused(&false);
+    check_instance_ttl();
+
+    // After set_admin
+    let new_admin = Address::generate(&ctx.env);
+    ctx.client().set_admin(&new_admin);
+    check_instance_ttl();
 }

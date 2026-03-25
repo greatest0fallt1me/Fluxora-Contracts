@@ -10667,3 +10667,1025 @@ fn test_extend_end_time_integration_full_withdrawal() {
     assert_eq!(ctx.token().balance(&ctx.contract_id), 0);
     assert_eq!(ctx.token().balance(&ctx.recipient), 2000);
 }
+
+// ===========================================================================
+// Persistent stream TTL: extend-on-read/write invariants (Issue #248)
+// ===========================================================================
+//
+// These tests verify that every code path touching contract storage
+// properly extends Time-To-Live (TTL) so that:
+//
+//   1. Instance entries (Config, NextStreamId, GlobalPaused) never silently
+//      expire between normal operations.
+//   2. Persistent stream entries are extended on every read AND write so
+//      that actively-queried or modified streams remain accessible.
+//   3. Persistent recipient index entries are extended on read (when
+//      non-empty) and on write.
+//   4. TTL values meet the protocol-defined thresholds:
+//      - INSTANCE_LIFETIME_THRESHOLD  = 17_280 (~1 day at 5s/ledger)
+//      - INSTANCE_BUMP_AMOUNT         = 120_960 (~7 days)
+//      - PERSISTENT_LIFETIME_THRESHOLD = 17_280 (~1 day)
+//      - PERSISTENT_BUMP_AMOUNT        = 120_960 (~7 days)
+//
+// Test utility: `env.as_contract(contract_id, || { ... })` allows
+// introspection of the contract's own storage, and the
+// `soroban_sdk::testutils::storage::{Persistent, Instance}` traits
+// provide `get_ttl()` for direct TTL assertions.
+
+// ---------------------------------------------------------------------------
+// §1  Instance storage TTL invariants
+// ---------------------------------------------------------------------------
+
+/// After `init()`, instance storage TTL must be at least INSTANCE_BUMP_AMOUNT.
+#[test]
+fn ttl_instance_storage_bumped_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+    client.init(&token, &admin);
+
+    let instance_ttl = env.as_contract(&contract_id, || {
+        use soroban_sdk::testutils::storage::Instance;
+        env.storage().instance().get_ttl()
+    });
+
+    // After init, instance TTL must be at least INSTANCE_BUMP_AMOUNT (120_960)
+    assert!(
+        instance_ttl >= 120_960,
+        "instance TTL after init must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
+    );
+}
+
+/// `get_config()` bumps instance TTL on every call.
+#[test]
+fn ttl_instance_storage_bumped_on_get_config() {
+    let ctx = TestContext::setup();
+
+    // Verify config read bumps instance TTL
+    ctx.client().get_config();
+
+    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Instance;
+        ctx.env.storage().instance().get_ttl()
+    });
+
+    assert!(
+        instance_ttl >= 120_960,
+        "instance TTL after get_config must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
+    );
+}
+
+/// `get_stream_count()` bumps instance TTL on every call.
+#[test]
+fn ttl_instance_storage_bumped_on_get_stream_count() {
+    let ctx = TestContext::setup();
+
+    ctx.client().get_stream_count();
+
+    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Instance;
+        ctx.env.storage().instance().get_ttl()
+    });
+
+    assert!(
+        instance_ttl >= 120_960,
+        "instance TTL after get_stream_count must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
+    );
+}
+
+/// `set_admin()` bumps instance TTL after updating the config.
+#[test]
+fn ttl_instance_storage_bumped_on_set_admin() {
+    let ctx = TestContext::setup();
+    let new_admin = Address::generate(&ctx.env);
+
+    ctx.client().set_admin(&new_admin);
+
+    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Instance;
+        ctx.env.storage().instance().get_ttl()
+    });
+
+    assert!(
+        instance_ttl >= 120_960,
+        "instance TTL after set_admin must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
+    );
+}
+
+/// `set_contract_paused()` bumps instance TTL.
+#[test]
+fn ttl_instance_storage_bumped_on_set_contract_paused() {
+    let ctx = TestContext::setup();
+
+    ctx.client().set_contract_paused(&true);
+
+    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Instance;
+        ctx.env.storage().instance().get_ttl()
+    });
+
+    assert!(
+        instance_ttl >= 120_960,
+        "instance TTL after set_contract_paused must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
+    );
+}
+
+/// `create_stream()` touches instance storage (NextStreamId) and bumps
+/// the instance TTL. Verify both instance and the new stream's persistent
+/// TTL are properly set.
+#[test]
+fn ttl_instance_and_stream_bumped_on_create_stream() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.create_default_stream();
+
+    // Instance TTL
+    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Instance;
+        ctx.env.storage().instance().get_ttl()
+    });
+    assert!(
+        instance_ttl >= 120_960,
+        "instance TTL after create_stream must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
+    );
+
+    // Stream persistent TTL
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after create_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §2  Persistent stream TTL extend-on-read invariants
+// ---------------------------------------------------------------------------
+
+/// `get_stream_state()` (read-only) extends the stream's persistent TTL.
+#[test]
+fn ttl_stream_extended_on_get_stream_state() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Read the stream state
+    ctx.client().get_stream_state(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after get_stream_state must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `calculate_accrued()` (read-only) extends the stream's persistent TTL.
+#[test]
+fn ttl_stream_extended_on_calculate_accrued() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().calculate_accrued(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after calculate_accrued must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `get_withdrawable()` (read-only) extends the stream's persistent TTL.
+#[test]
+fn ttl_stream_extended_on_get_withdrawable() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().get_withdrawable(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after get_withdrawable must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `get_claimable_at()` (read-only) extends the stream's persistent TTL.
+#[test]
+fn ttl_stream_extended_on_get_claimable_at() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().get_claimable_at(&stream_id, &500);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after get_claimable_at must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §3  Persistent stream TTL extend-on-write invariants
+// ---------------------------------------------------------------------------
+
+/// `withdraw()` modifies stream state and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after withdraw must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `withdraw_to()` modifies stream state and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_withdraw_to() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw_to(&stream_id, &destination);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after withdraw_to must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `pause_stream()` writes Paused status and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_pause() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after pause_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `resume_stream()` writes Active status and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_resume() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream(&stream_id);
+    ctx.client().resume_stream(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after resume_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `cancel_stream()` writes Cancelled status and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_cancel() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after cancel_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `cancel_stream_as_admin()` must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_cancel_as_admin() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after cancel_stream_as_admin must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `pause_stream_as_admin()` must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_pause_as_admin() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream_as_admin(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after pause_stream_as_admin must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `resume_stream_as_admin()` must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_resume_as_admin() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream_as_admin(&stream_id);
+    ctx.client().resume_stream_as_admin(&stream_id);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after resume_stream_as_admin must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `top_up_stream()` modifies deposit_amount and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_top_up() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Mint extra tokens for top-up
+    ctx.sac.mint(&ctx.sender, &5000_i128);
+
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &500_i128);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after top_up_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `update_rate_per_second()` modifies rate and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_update_rate() {
+    let ctx = TestContext::setup();
+    // Create stream with extra deposit so we can increase the rate
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128, // deposit=2000, duration=1000 → allows rate up to 2
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().update_rate_per_second(&stream_id, &2_i128);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after update_rate_per_second must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `shorten_stream_end_time()` modifies end_time and must extend the stream's TTL.
+#[test]
+fn ttl_stream_extended_on_shorten_end_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().shorten_stream_end_time(&stream_id, &800u64);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after shorten_stream_end_time must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `extend_stream_end_time()` modifies end_time and must extend the stream's TTL.
+/// Requires deposit to cover the new schedule.
+#[test]
+fn ttl_stream_extended_on_extend_end_time() {
+    let ctx = TestContext::setup();
+    // Create stream with extra deposit to allow extension
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128, // enough deposit for rate=1 × 2000s
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().extend_stream_end_time(&stream_id, &1500u64);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after extend_stream_end_time must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// `batch_withdraw()` reads and writes multiple streams; each must have TTL extended.
+#[test]
+fn ttl_streams_extended_on_batch_withdraw() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(500);
+    let ids = soroban_sdk::vec![&ctx.env, id0, id1];
+    ctx.client().batch_withdraw(&ctx.recipient, &ids);
+
+    // Both streams must have extended TTL
+    for sid in [id0, id1] {
+        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Stream(sid))
+        });
+        assert!(
+            stream_ttl >= 120_960,
+            "stream {sid} TTL after batch_withdraw must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4  Recipient index TTL invariants
+// ---------------------------------------------------------------------------
+
+/// After `create_stream()`, the recipient's index entry must have extended TTL.
+#[test]
+fn ttl_recipient_index_extended_on_create_stream() {
+    let ctx = TestContext::setup();
+    let _stream_id = ctx.create_default_stream();
+
+    let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::RecipientStreams(ctx.recipient.clone()))
+    });
+    assert!(
+        idx_ttl >= 120_960,
+        "recipient index TTL after create must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
+    );
+}
+
+/// After `get_recipient_streams()`, the recipient's index entry TTL must be
+/// extended (since it returns a non-empty index for this recipient).
+#[test]
+fn ttl_recipient_index_extended_on_get_recipient_streams() {
+    let ctx = TestContext::setup();
+    let _stream_id = ctx.create_default_stream();
+
+    // Perform the read
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 1);
+
+    let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::RecipientStreams(ctx.recipient.clone()))
+    });
+    assert!(
+        idx_ttl >= 120_960,
+        "recipient index TTL after get_recipient_streams must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
+    );
+}
+
+/// After `close_completed_stream()`, the stream entry must no longer exist,
+/// and the recipient's index must be updated (stream removed from index).
+#[test]
+fn ttl_close_completed_stream_removes_entry() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    // Close the completed stream — removes persistent entry
+    ctx.client().close_completed_stream(&stream_id);
+
+    // Stream entry must be removed
+    let exists = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        !exists,
+        "stream entry must be removed after close_completed_stream"
+    );
+
+    // Recipient index must no longer contain this stream ID
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(
+        streams.len(),
+        0,
+        "recipient index must be empty after closing the only stream"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §5  TTL persistence across lifecycle stages
+// ---------------------------------------------------------------------------
+
+/// Full lifecycle: create → partial withdraw → pause → resume →
+/// complete → close. Verify TTL is maintained at every stage.
+#[test]
+fn ttl_maintained_through_full_lifecycle() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let assert_ttl = |label: &str| {
+        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Stream(stream_id))
+        });
+        assert!(
+            stream_ttl >= 120_960,
+            "{label}: stream TTL must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+        );
+    };
+
+    // After create
+    assert_ttl("after create");
+
+    // After partial withdraw
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id);
+    assert_ttl("after partial withdraw");
+
+    // After pause
+    ctx.client().pause_stream(&stream_id);
+    assert_ttl("after pause");
+
+    // After resume
+    ctx.client().resume_stream(&stream_id);
+    assert_ttl("after resume");
+
+    // After final withdraw (completes the stream)
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    assert_ttl("after completion");
+
+    // After get_stream_state on completed stream
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+    assert_ttl("after get_stream_state on completed");
+}
+
+/// Cancel lifecycle: create → partial withdraw → cancel → read state.
+/// Stream TTL must be extended at each step.
+#[test]
+fn ttl_maintained_through_cancel_lifecycle() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Partial withdraw
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().withdraw(&stream_id);
+
+    // Cancel
+    ctx.client().cancel_stream(&stream_id);
+
+    // Stream must still be accessible and have good TTL
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "stream TTL after cancel must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+
+    // Subsequent read also extends
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+}
+
+/// Multiple streams created for the same recipient all get TTL extended,
+/// and the recipient index TTL is also maintained.
+#[test]
+fn ttl_multiple_streams_same_recipient_all_extended() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &500_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &500u64,
+    );
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &500_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &500u64,
+    );
+    let id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &500_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &500u64,
+    );
+
+    // All three streams must have proper TTL
+    for sid in [id0, id1, id2] {
+        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Stream(sid))
+        });
+        assert!(
+            stream_ttl >= 120_960,
+            "stream {sid} TTL must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+        );
+    }
+
+    // Recipient index must also have proper TTL
+    let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::RecipientStreams(ctx.recipient.clone()))
+    });
+    assert!(
+        idx_ttl >= 120_960,
+        "recipient index TTL must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
+    );
+
+    // Verify all 3 are in the recipient index
+    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(streams.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// §6  TTL constants are protocol-correct
+// ---------------------------------------------------------------------------
+
+/// Verify the TTL constants exported by the contract match the protocol spec:
+/// ~1 day threshold (17_280 ledgers at 5s each) and ~7 day bump (120_960 ledgers).
+#[test]
+fn ttl_constants_match_protocol_spec() {
+    // Instance storage
+    assert_eq!(
+        crate::INSTANCE_LIFETIME_THRESHOLD,
+        17_280,
+        "INSTANCE_LIFETIME_THRESHOLD must be ~1 day (17_280 ledgers)"
+    );
+    assert_eq!(
+        crate::INSTANCE_BUMP_AMOUNT,
+        120_960,
+        "INSTANCE_BUMP_AMOUNT must be ~7 days (120_960 ledgers)"
+    );
+
+    // Persistent storage
+    assert_eq!(
+        crate::PERSISTENT_LIFETIME_THRESHOLD,
+        17_280,
+        "PERSISTENT_LIFETIME_THRESHOLD must be ~1 day (17_280 ledgers)"
+    );
+    assert_eq!(
+        crate::PERSISTENT_BUMP_AMOUNT,
+        120_960,
+        "PERSISTENT_BUMP_AMOUNT must be ~7 days (120_960 ledgers)"
+    );
+
+    // Threshold must be strictly less than bump amount (otherwise bumps never fire)
+    const {
+        assert!(
+            crate::INSTANCE_LIFETIME_THRESHOLD < crate::INSTANCE_BUMP_AMOUNT,
+            // "threshold must be < bump amount for instance storage"
+        );
+    }
+    const {
+        assert!(
+            crate::PERSISTENT_LIFETIME_THRESHOLD < crate::PERSISTENT_BUMP_AMOUNT,
+            // "threshold must be < bump amount for persistent storage"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §7  Batch create_streams TTL invariants
+// ---------------------------------------------------------------------------
+
+/// `create_streams()` (batch) must extend TTL for every stream AND the
+/// recipient index for each distinct recipient.
+#[test]
+fn ttl_batch_create_extends_all_streams_and_indexes() {
+    let ctx = TestContext::setup();
+    let recipient2 = Address::generate(&ctx.env);
+
+    let params = soroban_sdk::vec![
+        &ctx.env,
+        CreateStreamParams {
+            recipient: ctx.recipient.clone(),
+            deposit_amount: 500,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 500,
+        },
+        CreateStreamParams {
+            recipient: recipient2.clone(),
+            deposit_amount: 500,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 500,
+        },
+    ];
+
+    ctx.env.ledger().set_timestamp(0);
+    let ids = ctx.client().create_streams(&ctx.sender, &params);
+    assert_eq!(ids.len(), 2);
+
+    // Both streams must have proper TTL
+    for i in 0..ids.len() {
+        let sid = ids.get(i).unwrap();
+        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Stream(sid))
+        });
+        assert!(
+            stream_ttl >= 120_960,
+            "batch stream {sid} TTL must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+        );
+    }
+
+    // Both recipient indexes must have proper TTL
+    for recip in [&ctx.recipient, &recipient2] {
+        let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            use soroban_sdk::testutils::storage::Persistent;
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::RecipientStreams(recip.clone()))
+        });
+        assert!(
+            idx_ttl >= 120_960,
+            "recipient index TTL for batch create must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §8  Edge case: TTL on streams in terminal states
+// ---------------------------------------------------------------------------
+
+/// A completed stream must still have its TTL extended on read,
+/// so that recipient/auditor queries don't cause silent expiration.
+#[test]
+fn ttl_completed_stream_extended_on_read() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    // TTL must still be extended
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "completed stream TTL after read must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// A cancelled stream must still have its TTL extended on read,
+/// so that dispute resolution and audits can access historical state.
+#[test]
+fn ttl_cancelled_stream_extended_on_read() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Read the cancelled stream
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "cancelled stream TTL after read must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
+
+/// A paused stream must have its TTL extended on read, so that it doesn't
+/// silently expire while paused.
+#[test]
+fn ttl_paused_stream_extended_on_read() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream(&stream_id);
+
+    // Read the paused stream
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        use soroban_sdk::testutils::storage::Persistent;
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Stream(stream_id))
+    });
+    assert!(
+        stream_ttl >= 120_960,
+        "paused stream TTL after read must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+    );
+}
